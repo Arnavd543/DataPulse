@@ -12,6 +12,10 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
+    aws_sns as sns,
+    aws_sns_subscriptions as subs,
+    aws_cloudwatch as cloudwatch,
+    aws_cloudwatch_actions as cw_actions,
 )
 from constructs import Construct
 
@@ -171,6 +175,38 @@ class DataPulseStack(Stack):
             description="DynamoDB table for quality metrics",
         )
 
+        # Main alert topic for all notifications
+        self.alert_topic = sns.Topic(
+            self, "AlertTopic",
+            topic_name="datapulse-alerts",
+            display_name="DataPulse Quality Alerts",
+            
+            # Enable FIFO for ordered delivery
+            # fifo=True,
+        )
+        
+        self.alert_topic.add_subscription(
+            subs.EmailSubscription("arnavd543@gmail.com")
+        )
+        
+        # Optional: Separate topic for high-severity alerts
+        self.critical_alert_topic = sns.Topic(
+            self, "CriticalAlertTopic",
+            topic_name="datapulse-critical-alerts",
+            display_name="DataPulse CRITICAL Alerts",
+        )
+        
+        # Can also add SMS for critical alerts
+        # self.critical_alert_topic.add_subscription(
+        #     subs.SmsSubscription("+1234567890")
+        # )
+        
+        CfnOutput(
+            self, "AlertTopicArn",
+            value=self.alert_topic.topic_arn,
+            description="SNS topic ARN for alerts",
+        )
+
         # Lambda function for schema validation
         self.schema_validator = lambda_.Function(
             self, "SchemaValidator",
@@ -245,6 +281,68 @@ class DataPulseStack(Stack):
             self, "QualityValidatorArn",
             value=self.quality_validator.function_arn,
         )
+
+        # ========================================
+        # PHASE 5: ANOMALY DETECTOR LAMBDA
+        # ========================================
+        # NOTE: Must be defined BEFORE Step Functions workflow
+
+        self.anomaly_detector = lambda_.Function(
+            self, "AnomalyDetector",
+            function_name="datapulse-anomaly-detector",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="anomaly_detector.handler",
+            code=lambda_.Code.from_asset("lambda/anomaly_detector"),
+            timeout=Duration.seconds(60),
+            memory_size=512,
+            environment={
+                "QUALITY_TABLE_NAME": self.quality_table.table_name,
+                "Z_SCORE_THRESHOLD": "3",
+                "EWMA_ALPHA": "0.2",
+                "LOOKBACK_DAYS": "7",
+                "MIN_HISTORICAL_POINTS": "3",
+                "LOG_LEVEL": "INFO",
+            },
+            log_retention=logs.RetentionDays.ONE_WEEK,
+            tracing=lambda_.Tracing.ACTIVE,
+        )
+
+        # Grant permissions
+        self.quality_table.grant_read_data(self.anomaly_detector)
+
+        self.anomaly_detector.add_to_role_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"]
+            )
+        )
+
+        # ========================================
+        # PHASE 6: ALERT ROUTER LAMBDA
+        # ========================================
+        # NOTE: Must be defined BEFORE Step Functions workflow
+
+        self.alert_router = lambda_.Function(
+            self, "AlertRouter",
+            function_name="datapulse-alert-router",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="alert_router.handler",
+            code=lambda_.Code.from_asset("lambda/alert_router"),
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            environment={
+                "ALERT_TOPIC_ARN": self.alert_topic.topic_arn,
+                "CRITICAL_ALERT_TOPIC_ARN": self.critical_alert_topic.topic_arn if hasattr(self, 'critical_alert_topic') else "",
+                "LOG_LEVEL": "INFO",
+            },
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+
+        # Grant SNS publish permissions
+        self.alert_topic.grant_publish(self.alert_router)
+        if hasattr(self, 'critical_alert_topic'):
+            self.critical_alert_topic.grant_publish(self.alert_router)
 
         # ========================================
         # PHASE 4: STEP FUNCTIONS WORKFLOW
@@ -328,6 +426,30 @@ class DataPulseStack(Stack):
             result_path="$.qualityError"
         )
 
+        anomaly_detection_task = tasks.LambdaInvoke(
+            self, "AnomalyDetectionTask",
+            lambda_function=self.anomaly_detector,
+            payload=sfn.TaskInput.from_object({
+                "metadata.$": "$.metadata",
+                "schemaResult.$": "$.schemaResult",
+                "qualityResult.$": "$.qualityResult",
+            }),
+            result_path="$.anomalyResult",
+            retry_on_service_exceptions=True,
+        )
+
+        alert_routing_task = tasks.LambdaInvoke(
+            self, "AlertRoutingTask",
+            lambda_function=self.alert_router,
+            payload=sfn.TaskInput.from_object({
+                "metadata.$": "$.metadata",
+                "schemaResult.$": "$.schemaResult",
+                "qualityResult.$": "$.qualityResult",
+                "anomalyResult.$": "$.anomalyResult",
+            }),
+            result_path="$.alertResult",
+        )
+
         quality_check = sfn.Choice(
             self, "QualityCheckPassed",
             comment="Branch based on quality check results"
@@ -354,14 +476,14 @@ class DataPulseStack(Stack):
         quality_failed.next(quality_passed)
 
         # Chain tasks: Schema → Quality → Check → Success/Failure
+                # Update workflow chain
         definition = schema_validation_task \
             .next(quality_validation_task) \
+            .next(anomaly_detection_task) \
+            .next(alert_routing_task) \
             .next(quality_check
                 .when(
-                    sfn.Condition.boolean_equals(
-                        "$.qualityResult.Payload.quality_report.passed",
-                        True
-                    ),
+                    sfn.Condition.boolean_equals("$.qualityResult.Payload.quality_report.passed", True),
                     quality_passed
                 )
                 .otherwise(quality_failed)
@@ -512,4 +634,379 @@ class DataPulseStack(Stack):
             self, "EventProcessorArn",
             value=self.event_processor.function_arn,
             description="Event processor Lambda ARN",
+        )
+
+        dashboard = cloudwatch.Dashboard(
+            self, "DataPulseDashboard",
+            dashboard_name="DataPulse-Overview",
+        )
+
+        # Quality score widget
+        quality_score_widget = cloudwatch.GraphWidget(
+            title="Quality Score by Pipeline (Last 24h)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="QualityScore",
+                    dimensions_map={"PipelineId": "customers"},
+                    statistic="Average",
+                    label="Customers",
+                    color=cloudwatch.Color.BLUE,
+                ),
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="QualityScore",
+                    dimensions_map={"PipelineId": "orders"},
+                    statistic="Average",
+                    label="Orders",
+                    color=cloudwatch.Color.GREEN,
+                ),
+            ],
+            width=12,
+            height=6,
+            left_y_axis=cloudwatch.YAxisProps(
+                label="Quality Score (%)",
+                min=0,
+                max=100,
+            ),
+        )
+        
+        # Failed checks widget
+        failed_checks_widget = cloudwatch.GraphWidget(
+            title="Failed Quality Checks (Last 24h)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="FailedChecks",
+                    statistic="Sum",
+                    label="Total Failed Checks",
+                    color=cloudwatch.Color.RED,
+                ),
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="PassedChecks",
+                    statistic="Sum",
+                    label="Total Passed Checks",
+                    color=cloudwatch.Color.GREEN,
+                ),
+            ],
+            width=12,
+            height=6,
+            stacked=False,
+        )
+
+        # Anomaly count widget
+        anomaly_widget = cloudwatch.GraphWidget(
+            title="Anomalies Detected (Last 7 days)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="AnomalyCount",
+                    statistic="Sum",
+                    label="Total Anomalies",
+                    color=cloudwatch.Color.ORANGE,
+                ),
+                cloudwatch.Metric(
+                    namespace="DataPulse",
+                    metric_name="HasAnomalies",
+                    statistic="Sum",
+                    label="Files with Anomalies",
+                    color=cloudwatch.Color.RED,
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+        
+        # Anomaly severity breakdown (single value widgets)
+        anomaly_severity_widget = cloudwatch.Row(
+            cloudwatch.SingleValueWidget(
+                title="Critical Anomalies",
+                metrics=[
+                    cloudwatch.Metric(
+                        namespace="DataPulse",
+                        metric_name="AnomalyCount",
+                        dimensions_map={"Severity": "CRITICAL"},
+                        statistic="Sum",
+                    )
+                ],
+                width=6,
+                height=3,
+            ),
+            cloudwatch.SingleValueWidget(
+                title="High Anomalies",
+                metrics=[
+                    cloudwatch.Metric(
+                        namespace="DataPulse",
+                        metric_name="AnomalyCount",
+                        dimensions_map={"Severity": "HIGH"},
+                        statistic="Sum",
+                    )
+                ],
+                width=6,
+                height=3,
+            ),
+            cloudwatch.SingleValueWidget(
+                title="Medium Anomalies",
+                metrics=[
+                    cloudwatch.Metric(
+                        namespace="DataPulse",
+                        metric_name="AnomalyCount",
+                        dimensions_map={"Severity": "MEDIUM"},
+                        statistic="Sum",
+                    )
+                ],
+                width=6,
+                height=3,
+            ),
+            cloudwatch.SingleValueWidget(
+                title="Low Anomalies",
+                metrics=[
+                    cloudwatch.Metric(
+                        namespace="DataPulse",
+                        metric_name="AnomalyCount",
+                        dimensions_map={"Severity": "LOW"},
+                        statistic="Sum",
+                    )
+                ],
+                width=6,
+                height=3,
+            ),
+        )
+
+        # Lambda duration widget
+        lambda_duration_widget = cloudwatch.GraphWidget(
+            title="Lambda Execution Duration (ms)",
+            left=[
+                self.schema_validator.metric_duration(
+                    label="Schema Validator",
+                    statistic="Average",
+                    color=cloudwatch.Color.BLUE,
+                ),
+                self.quality_validator.metric_duration(
+                    label="Quality Validator",
+                    statistic="Average",
+                    color=cloudwatch.Color.GREEN,
+                ),
+                self.anomaly_detector.metric_duration(
+                    label="Anomaly Detector",
+                    statistic="Average",
+                    color=cloudwatch.Color.ORANGE,
+                ),
+                self.alert_router.metric_duration(
+                    label="Alert Router",
+                    statistic="Average",
+                    color=cloudwatch.Color.PURPLE,
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+        
+        # Lambda errors widget
+        lambda_errors_widget = cloudwatch.GraphWidget(
+            title="Lambda Errors",
+            left=[
+                self.schema_validator.metric_errors(
+                    label="Schema Errors",
+                    color=cloudwatch.Color.RED,
+                ),
+                self.quality_validator.metric_errors(
+                    label="Quality Errors",
+                    color=cloudwatch.Color.ORANGE,
+                ),
+                self.anomaly_detector.metric_errors(
+                    label="Anomaly Errors",
+                    color=cloudwatch.Color.PURPLE,
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+
+        # Workflow executions widget
+        workflow_executions_widget = cloudwatch.GraphWidget(
+            title="Workflow Executions",
+            left=[
+                self.validation_workflow.metric_started(
+                    label="Started",
+                    color=cloudwatch.Color.BLUE,
+                ),
+                self.validation_workflow.metric_succeeded(
+                    label="Succeeded",
+                    color=cloudwatch.Color.GREEN,
+                ),
+                self.validation_workflow.metric_failed(
+                    label="Failed",
+                    color=cloudwatch.Color.RED,
+                ),
+                self.validation_workflow.metric_timed_out(
+                    label="Timed Out",
+                    color=cloudwatch.Color.ORANGE,
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+        
+        # Workflow duration widget
+        workflow_duration_widget = cloudwatch.GraphWidget(
+            title="Workflow Duration (seconds)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="AWS/States",
+                    metric_name="ExecutionTime",
+                    dimensions_map={
+                        "StateMachineArn": self.validation_workflow.state_machine_arn
+                    },
+                    statistic="Average",
+                    label="Average Duration",
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+
+        # Lambda invocations (for cost tracking)
+        lambda_invocations_widget = cloudwatch.GraphWidget(
+            title="Lambda Invocations (Cost Indicator)",
+            left=[
+                self.schema_validator.metric_invocations(label="Schema Validator"),
+                self.quality_validator.metric_invocations(label="Quality Validator"),
+                self.anomaly_detector.metric_invocations(label="Anomaly Detector"),
+                self.alert_router.metric_invocations(label="Alert Router"),
+            ],
+            width=12,
+            height=6,
+        )
+        
+        # DynamoDB operations (for cost tracking)
+        dynamodb_operations_widget = cloudwatch.GraphWidget(
+            title="DynamoDB Operations (Cost Indicator)",
+            left=[
+                cloudwatch.Metric(
+                    namespace="AWS/DynamoDB",
+                    metric_name="ConsumedReadCapacityUnits",
+                    dimensions_map={"TableName": self.schema_table.table_name},
+                    statistic="Sum",
+                    label="Schema Table Reads",
+                ),
+                cloudwatch.Metric(
+                    namespace="AWS/DynamoDB",
+                    metric_name="ConsumedWriteCapacityUnits",
+                    dimensions_map={"TableName": self.schema_table.table_name},
+                    statistic="Sum",
+                    label="Schema Table Writes",
+                ),
+                cloudwatch.Metric(
+                    namespace="AWS/DynamoDB",
+                    metric_name="ConsumedReadCapacityUnits",
+                    dimensions_map={"TableName": self.quality_table.table_name},
+                    statistic="Sum",
+                    label="Quality Table Reads",
+                ),
+                cloudwatch.Metric(
+                    namespace="AWS/DynamoDB",
+                    metric_name="ConsumedWriteCapacityUnits",
+                    dimensions_map={"TableName": self.quality_table.table_name},
+                    statistic="Sum",
+                    label="Quality Table Writes",
+                ),
+            ],
+            width=12,
+            height=6,
+        )
+
+        # Row 1: Quality metrics
+        dashboard.add_widgets(quality_score_widget, failed_checks_widget)
+        
+        # Row 2: Anomaly detection
+        dashboard.add_widgets(anomaly_widget)
+        dashboard.add_widgets(anomaly_severity_widget)
+        
+        # Row 3: Lambda performance
+        dashboard.add_widgets(lambda_duration_widget, lambda_errors_widget)
+        
+        # Row 4: Workflow metrics
+        dashboard.add_widgets(workflow_executions_widget, workflow_duration_widget)
+        
+        # Row 5: Cost tracking
+        dashboard.add_widgets(lambda_invocations_widget, dynamodb_operations_widget)
+
+        # Alarm: Low quality score
+        low_quality_alarm = cloudwatch.Alarm(
+            self, "LowQualityScoreAlarm",
+            alarm_name="datapulse-low-quality-score",
+            alarm_description="Alert when quality score drops below 70%",
+            metric=cloudwatch.Metric(
+                namespace="DataPulse",
+                metric_name="QualityScore",
+                statistic="Average",
+                period=Duration.minutes(5),
+            ),
+            threshold=70,
+            comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            evaluation_periods=2,
+            datapoints_to_alarm=2,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        
+        low_quality_alarm.add_alarm_action(cw_actions.SnsAction(self.alert_topic))
+        
+        # Alarm: High anomaly count
+        anomaly_alarm = cloudwatch.Alarm(
+            self, "HighAnomalyCountAlarm",
+            alarm_name="datapulse-high-anomaly-count",
+            alarm_description="Alert when 3+ anomalies detected in 15 minutes",
+            metric=cloudwatch.Metric(
+                namespace="DataPulse",
+                metric_name="AnomalyCount",
+                statistic="Sum",
+                period=Duration.minutes(15),
+            ),
+            threshold=3,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            evaluation_periods=1,
+        )
+        
+        anomaly_alarm.add_alarm_action(cw_actions.SnsAction(self.alert_topic))
+        
+        # Alarm: Lambda errors
+        lambda_error_alarm = cloudwatch.Alarm(
+            self, "LambdaErrorAlarm",
+            alarm_name="datapulse-lambda-errors",
+            alarm_description="Alert on any Lambda errors",
+            metric=cloudwatch.Metric(
+                namespace="AWS/Lambda",
+                metric_name="Errors",
+                dimensions_map={"FunctionName": self.quality_validator.function_name},
+                statistic="Sum",
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            evaluation_periods=1,
+        )
+        
+        lambda_error_alarm.add_alarm_action(cw_actions.SnsAction(self.alert_topic))
+        
+        # Alarm: Workflow failures
+        workflow_failure_alarm = cloudwatch.Alarm(
+            self, "WorkflowFailureAlarm",
+            alarm_name="datapulse-workflow-failures",
+            alarm_description="Alert on Step Functions workflow failures",
+            metric=self.validation_workflow.metric_failed(
+                period=Duration.minutes(5),
+            ),
+            threshold=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            evaluation_periods=1,
+        )
+        
+        workflow_failure_alarm.add_alarm_action(cw_actions.SnsAction(self.critical_alert_topic if hasattr(self, 'critical_alert_topic') else self.alert_topic))
+
+        CfnOutput(
+            self, "DashboardUrl",
+            value=f"https://console.aws.amazon.com/cloudwatch/home?region={self.region}#dashboards:name=DataPulse-Overview",
+            description="CloudWatch Dashboard URL",
         )
