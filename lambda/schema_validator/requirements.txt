@@ -1,0 +1,5 @@
+# AWS SDK for Python
+boto3>=1.28.0
+
+# Optional: For better decimal handling
+python-dateutil>=2.8.0
